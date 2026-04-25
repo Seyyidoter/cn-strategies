@@ -3,11 +3,12 @@ Bu dosya hafif makine öğrenmesi destekli stratejiyi içerir.
 
 Yöntem:
 - Ortak feature set üzerinden yön tahmini yapar
-- Model: RandomForestClassifier
+- Model: LogisticRegression
 - Model predict içinde eğitilmez
 - Önce get_data(), sonra model eğitimi, sonra backtest.run()
 
 Bu sürümde:
+- Tüm karar mantığı (decisions listesi, sinyal, allocation, TP/SL) predict içinde
 - gereksiz ikinci add_indicators çağrısı kaldırıldı
 - sklearn warning'i çıkmaması için tahmin sırasında DataFrame veriliyor
 """
@@ -29,7 +30,6 @@ from config import (
     MIN_HISTORY,
 )
 from indicators import add_indicators
-from utils import has_nan, build_tp_sl, _flat_decision
 
 
 class MLConfirmedStrategy(BaseStrategy):
@@ -46,9 +46,6 @@ class MLConfirmedStrategy(BaseStrategy):
             "volume_confirmed",
             "volume_spike",
         ]
-
-    # _flat_decision is now imported from utils
-    pass
 
     def _feature_frame(self, enriched_df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -127,60 +124,53 @@ class MLConfirmedStrategy(BaseStrategy):
                 logging.error(f"Eğitilmiş model bulunamadı: {model_path} - Lütfen önce modelleri eğitin!")
         logging.info("Tüm modeller başarıyla diskten yüklendi.")
 
-    def _build_long_decision(self, coin: str, entry: float) -> dict:
-        take_profit, stop_loss = build_tp_sl(
-            entry=entry,
-            direction=1,
-            stop_loss_pct=ML_STOP_LOSS_PCT,
-            take_profit_pct=ML_TAKE_PROFIT_PCT,
-        )
-        return {
-            "coin": coin,
-            "signal": 1,
-            "allocation": ML_ALLOCATION,
-            "leverage": DEFAULT_LEVERAGE,
-            "take_profit": take_profit,
-            "stop_loss": stop_loss,
-        }
-
-    def _build_short_decision(self, coin: str, entry: float) -> dict:
-        take_profit, stop_loss = build_tp_sl(
-            entry=entry,
-            direction=-1,
-            stop_loss_pct=ML_STOP_LOSS_PCT,
-            take_profit_pct=ML_TAKE_PROFIT_PCT,
-        )
-        return {
-            "coin": coin,
-            "signal": -1,
-            "allocation": ML_ALLOCATION,
-            "leverage": DEFAULT_LEVERAGE,
-            "take_profit": take_profit,
-            "stop_loss": stop_loss,
-        }
-
     def predict(self, data: dict) -> list[dict]:
         decisions = []
 
         for coin, df in data.items():
+            # --- Model veya yeterli veri yoksa FLAT ---
             if coin not in self.models or len(df) < MIN_HISTORY:
-                decisions.append(_flat_decision(coin))
+                decisions.append({
+                    "coin": coin,
+                    "signal": 0,
+                    "allocation": 0.0,
+                    "leverage": 1,
+                })
                 continue
 
             try:
+                # --- İndikatör hesapla ve feature çıkar ---
                 enriched = add_indicators(df)
                 X = self._feature_frame(enriched).dropna()
 
                 if len(X) == 0:
-                    decisions.append(_flat_decision(coin))
+                    decisions.append({
+                        "coin": coin,
+                        "signal": 0,
+                        "allocation": 0.0,
+                        "leverage": 1,
+                    })
                     continue
 
                 last_features = X.iloc[[-1]][self.feature_columns]
 
-                if has_nan(last_features.iloc[0].values):
-                    decisions.append(_flat_decision(coin))
+                # NaN kontrolü
+                has_nan = False
+                for value in last_features.iloc[0].values:
+                    if value is None or value != value:
+                        has_nan = True
+                        break
+
+                if has_nan:
+                    decisions.append({
+                        "coin": coin,
+                        "signal": 0,
+                        "allocation": 0.0,
+                        "leverage": 1,
+                    })
                     continue
 
+                # --- Model tahmini ---
                 model = self.models[coin]
                 proba = model.predict_proba(last_features)[0]
 
@@ -192,14 +182,47 @@ class MLConfirmedStrategy(BaseStrategy):
 
                 entry = float(enriched["Close"].iloc[-1])
 
+                # --- Sinyal ve karar oluşturma ---
                 if proba_up >= ML_PROBA_THRESHOLD:
-                    decisions.append(self._build_long_decision(coin, entry))
+                    # LONG sinyali
+                    take_profit = max(1e-8, entry * (1 + ML_TAKE_PROFIT_PCT))
+                    stop_loss = max(1e-8, entry * (1 - ML_STOP_LOSS_PCT))
+                    decisions.append({
+                        "coin": coin,
+                        "signal": 1,
+                        "allocation": ML_ALLOCATION,
+                        "leverage": DEFAULT_LEVERAGE,
+                        "take_profit": take_profit,
+                        "stop_loss": stop_loss,
+                    })
                 elif proba_up <= (1 - ML_PROBA_THRESHOLD):
-                    decisions.append(self._build_short_decision(coin, entry))
+                    # SHORT sinyali
+                    take_profit = max(1e-8, entry * (1 - ML_TAKE_PROFIT_PCT))
+                    stop_loss = max(1e-8, entry * (1 + ML_STOP_LOSS_PCT))
+                    decisions.append({
+                        "coin": coin,
+                        "signal": -1,
+                        "allocation": ML_ALLOCATION,
+                        "leverage": DEFAULT_LEVERAGE,
+                        "take_profit": take_profit,
+                        "stop_loss": stop_loss,
+                    })
                 else:
-                    decisions.append(_flat_decision(coin))
+                    # FLAT — sinyal yok
+                    decisions.append({
+                        "coin": coin,
+                        "signal": 0,
+                        "allocation": 0.0,
+                        "leverage": 1,
+                    })
+
             except Exception as e:
                 logging.warning(f"Predict error for {coin}: {e}")
-                decisions.append(_flat_decision(coin))
+                decisions.append({
+                    "coin": coin,
+                    "signal": 0,
+                    "allocation": 0.0,
+                    "leverage": 1,
+                })
 
         return decisions
